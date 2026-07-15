@@ -123,13 +123,29 @@ def quote(symbol: str, timeframe: str = Query("4h")):
         raise HTTPException(503, f"data unavailable: {e}")
     last = df.iloc[-1]
     ts = df.index[-1]
+
+    # Real-time price: Finnhub first (orchestrator quote chain), candle close
+    # only as a fallback. Candles may lag ~15 min (Yahoo); the quote does not.
+    price = float(last["close"])
+    price_src = src
+    price_ts = ts
+    try:
+        q = service.data.get_quote(symbol)
+        price = float(q["price"])
+        price_src = q["source"]
+        price_ts = pd.Timestamp(q["timestamp"])
+    except ProviderError:
+        pass
+
     age_h = (datetime.now(timezone.utc) - ts.to_pydatetime()).total_seconds() / 3600
     # a candle older than ~3 bars of the timeframe is considered stale
     tf_h = TIMEFRAMES[timeframe]["minutes"] / 60
     stale = age_h > tf_h * 3
     return {
         "symbol": symbol, "name": SYMBOLS[symbol]["name"],
-        "current_price": round(float(last["close"]), 4),
+        "current_price": round(price, 4),
+        "price_source": price_src,
+        "price_timestamp": price_ts.isoformat(),
         "last_candle": {"open": round(float(last["open"]), 4), "high": round(float(last["high"]), 4),
                         "low": round(float(last["low"]), 4), "close": round(float(last["close"]), 4)},
         "volume": float(last["volume"]),
