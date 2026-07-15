@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: ai-trading-terminal
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/info
+    envVars:
+      - key: FINNHUB_API_KEY
+        value: d9br8bpr01ql2jmt5gf0d9br8bpr01ql2jmt5gfg

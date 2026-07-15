@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Vlastné triedy, ktoré komponent používa navyše k svojmu <style> bloku */
+.text-primary { color: var(--text-primary); }
+.hover\:text-primary:hover { color: var(--text-primary); }
+.border-accent { border-color: var(--accent); }
+.hover\:bg-raised:hover { background: var(--bg-raised); }
+.hover\:text-bear:hover { color: var(--bear); }
+.bg-void { background: var(--bg-void); }
+.bg-panel { background: var(--bg-panel); }
+
+body { margin: 0; background: #090b10; }
