@@ -87,8 +87,17 @@ HIST = {
     "vol_bucket_pct": 25,      # bucket width for volume-change matching
 }
 
+# ---- active trade universe ---------------------------------------------------
+# Symbols the system actively TRADES (scan + calibration). Based on the first
+# real-data 4h calibration (2026-07): trend-followed names + gold carried the
+# edge, while slow index ETFs (QQQ/SPY) and AMD/MSFT bled small stop-losses.
+# All SYMBOLS stay viewable/analyzable; this only narrows what gets traded.
+# Override with env TRADE_UNIVERSE="NVDA,TSLA,..." after your own walk-forward.
+TRADE_UNIVERSE = [s.strip() for s in os.getenv(
+    "TRADE_UNIVERSE", "NVDA,TSLA,AAPL,META,GLD").split(",") if s.strip() in SYMBOLS]
+
 DB_PATH = os.getenv("DB_PATH", "trading.db")
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "60"))  # re-fetch at most this often
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # re-fetch at most this often
 
 # ---- optional free API keys (system works fully without them) --------------
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d9br8bpr01ql2jmt5gf0d9br8bpr01ql2jmt5gfg")  # primary real-time source; rotate at finnhub.io and override via env
