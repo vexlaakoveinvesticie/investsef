@@ -128,10 +128,7 @@ function computeADX(candles, period = 14) {
   return adx;
 }
 
-function buildMarketData(assetKey, count = 180, stepMinutes = 15) {
-  const a = ASSETS[assetKey];
-  const volScale = Math.sqrt(stepMinutes / 15);
-  const candles = generateCandles(a.base, a.vol * volScale, count, a.seed);
+function computeMarketData(candles, times) {
   const closes = candles.map((c) => c.close);
   const ema20 = computeEMA(closes, 20);
   const ema50 = computeEMA(closes, 50);
@@ -146,13 +143,30 @@ function buildMarketData(assetKey, count = 180, stepMinutes = 15) {
   const srWindow = candles.slice(Math.max(0, last - 40));
   const resistance = Math.max(...srWindow.map((c) => c.high));
   const support = Math.min(...srWindow.map((c) => c.low));
+  return { candles, closes, ema20, ema50, rsi14, histogram, atr14, adx14, avgVol20, unusualVolume, resistance, support, times };
+}
+
+function buildMarketData(assetKey, count = 180, stepMinutes = 15) {
+  const a = ASSETS[assetKey];
+  const volScale = Math.sqrt(stepMinutes / 15);
+  const candles = generateCandles(a.base, a.vol * volScale, count, a.seed);
   const now = new Date();
   const times = [];
   for (let i = count - 1; i >= 0; i--) {
     const t = new Date(now.getTime() - i * stepMinutes * 60000);
     times.push(t.toLocaleTimeString("sk-SK", { hour: "2-digit", minute: "2-digit" }));
   }
-  return { candles, closes, ema20, ema50, rsi14, histogram, atr14, adx14, avgVol20, unusualVolume, resistance, support, times };
+  return computeMarketData(candles, times);
+}
+
+/* Reálne sviečky z backendu (/api/candles) -> rovnaká štruktúra ako demo. */
+function buildMarketDataFromApi(apiCandles) {
+  const candles = apiCandles.map((c) => ({
+    open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+  }));
+  const times = apiCandles.map((c) =>
+    new Date(c.time).toLocaleTimeString("sk-SK", { hour: "2-digit", minute: "2-digit" }));
+  return computeMarketData(candles, times);
 }
 
 function deriveAnalysis(d) {
@@ -408,6 +422,7 @@ const API = {
     return this._get(`/api/decision/${symbol}?timeframe=${tf}&account=${account}&risk_pct=${riskPct}`);
   },
   analyze(symbol, tf) { return this._get(`/api/analyze/${symbol}?timeframe=${tf}`); },
+  candles(symbol, tf, limit = 180) { return this._get(`/api/candles/${symbol}?timeframe=${tf}&limit=${limit}`); },
   calibrate(tf, target) { return this._get(`/api/calibrate?timeframe=${tf}&target_trades=${target}`); },
   quote(symbol, tf) { return this._get(`/api/quote/${symbol}?timeframe=${tf}`); },
   scan(tf, account, riskPct, minGrade) {
@@ -1665,11 +1680,31 @@ function ScannerTab({ selectedAsset, onSelect }) {
 
 function ChartsTab({ assetKey, a }) {
   const TF = { "1m": 1, "5m": 5, "15m": 15, "1H": 60, "4H": 240, "1D": 1440 };
+  const API_TF = { "1m": "1m", "5m": "5m", "15m": "15m", "1H": "1h", "4H": "4h", "1D": "1d" };
   const [tf, setTf] = useState("15m");
-  const marketData = useMemo(() => buildMarketData(assetKey, 150, TF[tf]), [assetKey, tf]);
+  const [liveMD, setLiveMD] = useState(null);
+  useEffect(() => {
+    let mounted = true;
+    setLiveMD(null);
+    (async () => {
+      try {
+        const r = await API.candles(assetKey, API_TF[tf], 150);
+        if (mounted && r?.candles?.length > 30)
+          setLiveMD({ md: buildMarketDataFromApi(r.candles), source: r.source });
+      } catch {}
+    })();
+    return () => { mounted = false; };
+  }, [assetKey, tf]);
+  const marketData = useMemo(
+    () => (liveMD ? liveMD.md : buildMarketData(assetKey, 150, TF[tf])),
+    [assetKey, tf, liveMD]
+  );
   const chartData = marketData.candles.map((c, i) => ({ time: marketData.times[i], close: c.close, ema20: marketData.ema20[i], ema50: marketData.ema50[i], volume: c.volume }));
   return (
-    <Panel title={`${ASSETS[assetKey].symbol} — ${tf}`} icon={BarChart3} right={<Sim />}>
+    <Panel title={`${ASSETS[assetKey].symbol} — ${tf}`} icon={BarChart3}
+      right={liveMD
+        ? <span className="tag bull-tag"><Wifi size={11} /> LIVE · {liveMD.source}</span>
+        : <Sim />}>
       <div className="flex gap-1.5 mb-3 flex-wrap">
         {Object.keys(TF).map((k) => (
           <button key={k} onClick={() => setTf(k)}
@@ -1985,11 +2020,43 @@ export default function TradingTerminal() {
     return () => clearInterval(id);
   }, []);
 
-  const marketData = useMemo(() => buildMarketData(selectedAsset, 180, 15), [selectedAsset]);
+  const [liveMD, setLiveMD] = useState(null);     // reálne sviečky z backendu
+  const [liveQuote, setLiveQuote] = useState(null); // živá cena (Finnhub)
+
+  useEffect(() => {
+    let mounted = true;
+    setLiveMD(null); setLiveQuote(null);
+    (async () => {
+      try {
+        const r = await API.candles(selectedAsset, "15m", 180);
+        if (mounted && r?.candles?.length > 30)
+          setLiveMD({ md: buildMarketDataFromApi(r.candles), source: r.source });
+      } catch {}
+    })();
+    const poll = async () => {
+      try { const q = await API.quote(selectedAsset, "15m"); if (mounted) setLiveQuote(q); } catch {}
+    };
+    poll();
+    const qid = setInterval(poll, 60000);       // živá cena každú minútu
+    const cid = setInterval(async () => {       // sviečky každých 5 minút
+      try {
+        const r = await API.candles(selectedAsset, "15m", 180);
+        if (mounted && r?.candles?.length > 30)
+          setLiveMD({ md: buildMarketDataFromApi(r.candles), source: r.source });
+      } catch {}
+    }, 300000);
+    return () => { mounted = false; clearInterval(qid); clearInterval(cid); };
+  }, [selectedAsset]);
+
+  const marketData = useMemo(
+    () => (liveMD ? liveMD.md : buildMarketData(selectedAsset, 180, 15)),
+    [selectedAsset, liveMD]
+  );
   const a = useMemo(() => deriveAnalysis(marketData), [marketData]);
 
   const jitter = useMemo(() => (mulberry32(tick * 97 + ASSETS[selectedAsset].seed)() - 0.5) * 0.0006 * a.price, [tick, selectedAsset, a.price]);
-  const livePrice = a.price + jitter;
+  const livePrice = liveQuote ? liveQuote.current_price : a.price + jitter;
+  const isLiveData = Boolean(liveMD || liveQuote);
   const dayChangePct = ((livePrice - marketData.candles[0].open) / marketData.candles[0].open) * 100;
 
   return (
@@ -2044,7 +2111,12 @@ export default function TradingTerminal() {
               {Object.keys(ASSETS).map((k) => <option key={k} value={k}>{ASSETS[k].symbol}</option>)}
             </select>
             <div className="text-right">
-              <div className="text-lg font-mono font-semibold">{fmtPrice(livePrice, selectedAsset)}</div>
+              <div className="flex items-center justify-end gap-2">
+                {isLiveData
+                  ? <span className="tag bull-tag"><Wifi size={10} /> LIVE</span>
+                  : <span className="sim-badge">DEMO</span>}
+                <div className="text-lg font-mono font-semibold">{fmtPrice(livePrice, selectedAsset)}</div>
+              </div>
               <div className="text-[11px] font-mono" style={{ color: dayChangePct >= 0 ? "var(--bull)" : "var(--bear)" }}>{fmtPct(dayChangePct)}</div>
             </div>
           </div>
