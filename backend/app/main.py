@@ -156,6 +156,25 @@ def quote(symbol: str, timeframe: str = Query("4h")):
     }
 
 
+@app.get("/api/candles/{symbol}")
+def candles(symbol: str, timeframe: str = Query("15m"), limit: int = Query(180, le=500)):
+    """Raw OHLCV series for frontend charts (real data, same failover chain)."""
+    _validate(symbol, timeframe)
+    try:
+        df, src = service.data.get_candles(symbol, timeframe)
+    except ProviderError as e:
+        raise HTTPException(503, f"data unavailable: {e}")
+    df = df.tail(limit)
+    return {
+        "symbol": symbol, "timeframe": timeframe, "source": src,
+        "candles": [
+            {"time": ts.isoformat(), "open": float(r["open"]), "high": float(r["high"]),
+             "low": float(r["low"]), "close": float(r["close"]), "volume": float(r["volume"])}
+            for ts, r in df.iterrows()
+        ],
+    }
+
+
 @app.get("/api/scan")
 def scan(timeframe: str = Query("4h"), account: float = Query(10000.0, gt=0),
          risk_pct: float = Query(1.0, gt=0, le=100), min_grade: str = Query("B")):
