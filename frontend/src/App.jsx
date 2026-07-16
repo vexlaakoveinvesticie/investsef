@@ -535,6 +535,7 @@ function AssistantTab({ assetKey, setSelectedAsset, marketData, a, openTrades, s
   const [notes, setNotes] = useState([]);       // notification feed
   const [tick, setTick] = useState(0);
   const [freshness, setFreshness] = useState(null); // { source, timestamp, ageHours, stale, timeframe }
+  const [tf, setTf] = useState(SWING_TF);       // analysis timeframe (4h default; 15m/1h for pre-market)
 
   // live price simulation for the monitor (or last price)
   useEffect(() => {
@@ -548,15 +549,15 @@ function AssistantTab({ assetKey, setSelectedAsset, marketData, a, openTrades, s
     setPhase("analyzing"); setDec(null); setFreshness(null);
     // fetch data freshness (source / last update / delay) alongside the decision
     try {
-      const q = await API.quote(assetKey, SWING_TF);
+      const q = await API.quote(assetKey, tf);
       setFreshness({
         source: q.data_source, timestamp: q.timestamp, price: q.current_price,
-        ageHours: q.age_hours, stale: q.stale, timeframe: q.timeframe || SWING_TF,
+        ageHours: q.age_hours, stale: q.stale, timeframe: q.timeframe || tf,
       });
     } catch { setFreshness(null); }
     // try live backend decision, fall back to local engine
     try {
-      const res = await API.decision(assetKey, SWING_TF, account, riskPct);
+      const res = await API.decision(assetKey, tf, account, riskPct);
       setDec(mapApiDecision(res, assetKey)); setLive(true);
     } catch {
       const d = deriveTradeDecision(assetKey, a, marketData, account, riskPct, 15);
@@ -666,7 +667,19 @@ function AssistantTab({ assetKey, setSelectedAsset, marketData, a, openTrades, s
             ))}
           </div>
           <div className="text-2xl font-mono font-bold mb-1">{ASSETS[assetKey].symbol}</div>
-          <div className="text-sm font-mono text-secondary mb-4">{fmtPrice(livePrice, assetKey)}</div>
+          <div className="text-sm font-mono text-secondary mb-3">{fmtPrice(livePrice, assetKey)}</div>
+          <div className="text-[11px] text-secondary font-mono uppercase tracking-wide mb-2">Timeframe</div>
+          <div className="flex justify-center gap-2 flex-wrap mb-2">
+            {["15m", "1h", "4h", "1d"].map((t) => (
+              <button key={t} onClick={() => { setTf(t); setPhase("idle"); setDec(null); }}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${tf === t ? "border-accent text-accent bg-accent-soft" : "border-hairline text-secondary hover:text-primary"}`}>
+                {t}
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] text-secondary mb-4 max-w-sm mx-auto leading-relaxed">
+            Pre swing (2–7 dní) používaj <b>4h</b> alebo <b>1d</b>. Pre <b>pre-market</b> pohyb prepni na <b>15m</b> alebo <b>1h</b> — pre-market sviečky sú ale oneskorené (~15 min) a menej spoľahlivé.
+          </p>
           <button onClick={analyze} disabled={phase === "analyzing"}
             className={phase === "analyzing" ? "btn-disabled px-8 py-3 rounded-xl font-bold text-sm" : "btn-enter px-8 py-3 rounded-xl font-bold text-sm"}>
             {phase === "analyzing" ? "Analyzujem trh…" : "ANALYZE MARKET"}

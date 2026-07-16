@@ -27,10 +27,15 @@ class YFinanceProvider(MarketDataProvider):
         # 4h isn't a native yfinance interval -> pull 1h and resample below.
         interval = tf["yf_interval"]
 
+        # Include pre-market / after-hours candles for intraday timeframes.
+        # (prepost only affects intraday data; daily/weekly ignore it.)
+        prepost = timeframe in ("1m", "5m", "15m", "1h", "4h")
+
         try:
             df = yf.download(
                 ticker, interval=interval, period=tf["yf_period"],
                 auto_adjust=False, progress=False, threads=False,
+                prepost=prepost,
             )
         except Exception as e:  # network / parsing / rate-limit
             raise ProviderError(f"yfinance download failed: {e}")
