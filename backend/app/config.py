@@ -100,7 +100,7 @@ DB_PATH = os.getenv("DB_PATH", "trading.db")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # re-fetch at most this often
 
 # ---- optional free API keys (system works fully without them) --------------
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d9br8bpr01ql2jmt5gf0d9br8bpr01ql2jmt5gfg")  # primary real-time source; rotate at finnhub.io and override via env
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")  # primary real-time source; set via env / .env only — never hardcode
 ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "")  # optional, 25 req/day only
 
 # ---- CORS: comma-separated allowed origins for the frontend ----------------

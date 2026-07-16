@@ -424,6 +424,7 @@ const API = {
   candles(symbol, tf, limit = 180) { return this._get(`/api/candles/${symbol}?timeframe=${tf}&limit=${limit}`); },
   calibrate(tf, target) { return this._get(`/api/calibrate?timeframe=${tf}&target_trades=${target}`); },
   quote(symbol, tf) { return this._get(`/api/quote/${symbol}?timeframe=${tf}`); },
+  systemTest(symbol, tf) { return this._get(`/api/system-test?symbol=${symbol}&timeframe=${tf}`); },
   scan(tf, account, riskPct, minGrade) {
     return this._get(`/api/scan?timeframe=${tf}&account=${account}&risk_pct=${riskPct}&min_grade=${minGrade}`);
   },
@@ -533,6 +534,7 @@ function AssistantTab({ assetKey, setSelectedAsset, marketData, a, openTrades, s
   const [riskPct] = useState(1);
   const [notes, setNotes] = useState([]);       // notification feed
   const [tick, setTick] = useState(0);
+  const [freshness, setFreshness] = useState(null); // { source, timestamp, ageHours, stale, timeframe }
 
   // live price simulation for the monitor (or last price)
   useEffect(() => {
@@ -540,11 +542,19 @@ function AssistantTab({ assetKey, setSelectedAsset, marketData, a, openTrades, s
     return () => clearInterval(id);
   }, []);
   const jitter = useMemo(() => (mulberry32(tick * 131 + ASSETS[assetKey].seed)() - 0.5) * 0.0008 * a.price, [tick, assetKey, a.price]);
-  const livePrice = a.price + jitter;
+  const livePrice = freshness && freshness.price ? freshness.price : a.price + jitter;
 
   const analyze = async () => {
-    setPhase("analyzing"); setDec(null);
-    // try live backend, fall back to local engine
+    setPhase("analyzing"); setDec(null); setFreshness(null);
+    // fetch data freshness (source / last update / delay) alongside the decision
+    try {
+      const q = await API.quote(assetKey, SWING_TF);
+      setFreshness({
+        source: q.data_source, timestamp: q.timestamp, price: q.current_price,
+        ageHours: q.age_hours, stale: q.stale, timeframe: q.timeframe || SWING_TF,
+      });
+    } catch { setFreshness(null); }
+    // try live backend decision, fall back to local engine
     try {
       const res = await API.decision(assetKey, SWING_TF, account, riskPct);
       setDec(mapApiDecision(res, assetKey)); setLive(true);
@@ -555,6 +565,22 @@ function AssistantTab({ assetKey, setSelectedAsset, marketData, a, openTrades, s
     }
     setTimeout(() => setPhase("result"), 350); // brief "analyzing" beat
   };
+
+  // format "last update" and delay for display
+  const freshnessView = useMemo(() => {
+    if (!freshness) return null;
+    const dt = freshness.timestamp ? new Date(freshness.timestamp) : null;
+    const ageH = freshness.ageHours != null ? freshness.ageHours : null;
+    const delay = ageH == null ? "—"
+      : ageH < 1 ? `${Math.round(ageH * 60)} min`
+      : ageH < 48 ? `${ageH.toFixed(1)} h`
+      : `${(ageH / 24).toFixed(1)} dní`;
+    return {
+      source: (freshness.source || "—").toUpperCase(),
+      lastUpdate: dt ? dt.toLocaleString("sk-SK") : "—",
+      delay, stale: freshness.stale, timeframe: freshness.timeframe,
+    };
+  }, [freshness]);
 
   const isSetup = dec && dec.decision === "SETUP";
   // only recommend Quality A/B; a C-grade setup is downgraded to NO TRADE
@@ -651,12 +677,40 @@ function AssistantTab({ assetKey, setSelectedAsset, marketData, a, openTrades, s
       {/* STEP 3: decision card */}
       {phase === "result" && dec && statusLabel && (
         <Panel>
+          {!live && (
+            <div className="rounded-xl border p-3 mb-3 text-center"
+              style={{ background: "var(--bear-soft)", borderColor: "var(--bear)" }}>
+              <div className="font-bold text-sm" style={{ color: "var(--bear)" }}>⚠ DEMO — SIMULOVANÉ ČÍSLA</div>
+              <div className="text-[12px] text-secondary mt-1 leading-relaxed">
+                Toto NIE sú reálne trhové dáta. Čísla sú náhodne generované a menia sa —
+                <b> neobchoduj podľa nich s reálnymi peniazmi.</b> Pripoj backend v Nastaveniach a over cez System Test.
+              </div>
+            </div>
+          )}
           <div className="text-center py-3 rounded-xl mb-3" style={{ background: "var(--bg-raised)" }}>
             <div className="text-3xl mb-1">{statusLabel.icon}</div>
             <div className="text-xl font-bold" style={{ color: statusLabel.color }}>{statusLabel.text}</div>
-            <div className="text-[12px] text-secondary font-mono mt-1">{ASSETS[assetKey].symbol} · {new Date().toLocaleString("sk-SK")}</div>
+            <div className="text-[12px] text-secondary font-mono mt-1">{ASSETS[assetKey].symbol} · {new Date().toLocaleString("sk-SK")}{live ? "" : " · DEMO"}</div>
             {dec.quality && <div className="mt-2 flex justify-center"><QualityBadge q={dec.quality} /></div>}
           </div>
+
+          {/* DATA FRESHNESS */}
+          {freshnessView && (
+            <div className="mb-3">
+              {freshnessView.stale && (
+                <div className="rounded-xl border p-2.5 mb-2 text-center font-bold text-sm"
+                  style={{ background: "var(--bear-soft)", borderColor: "var(--bear)", color: "var(--bear)" }}>
+                  ⚠ DATA TOO OLD — DO NOT TRADE
+                </div>
+              )}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 font-mono text-center">
+                <div className="rounded-lg bg-raised p-2"><div className="text-[9px] text-secondary">DATA SOURCE</div><div className="text-xs font-semibold">{freshnessView.source}</div></div>
+                <div className="rounded-lg bg-raised p-2"><div className="text-[9px] text-secondary">LAST UPDATE</div><div className="text-xs font-semibold">{freshnessView.lastUpdate}</div></div>
+                <div className="rounded-lg bg-raised p-2"><div className="text-[9px] text-secondary">DATA DELAY</div><div className="text-xs font-semibold" style={{ color: freshnessView.stale ? "var(--bear)" : "var(--text-primary)" }}>{freshnessView.delay}</div></div>
+                <div className="rounded-lg bg-raised p-2"><div className="text-[9px] text-secondary">TIMEFRAME</div><div className="text-xs font-semibold">{freshnessView.timeframe}</div></div>
+              </div>
+            </div>
+          )}
 
           {recommended ? (
             <>
@@ -665,20 +719,23 @@ function AssistantTab({ assetKey, setSelectedAsset, marketData, a, openTrades, s
                 <div className="rounded-lg bg-raised p-2.5"><div className="text-[10px] text-secondary">STOP LOSS</div><div className="text-sm font-bold" style={{ color: "var(--bear)" }}>{fmtPrice(dec.stop, assetKey)}</div></div>
                 <div className="rounded-lg bg-raised p-2.5"><div className="text-[10px] text-secondary">TAKE PROFIT</div><div className="text-sm font-bold" style={{ color: "var(--bull)" }}>{fmtPrice(dec.tp1, assetKey)}</div></div>
                 <div className="rounded-lg bg-raised p-2.5"><div className="text-[10px] text-secondary">RISK/REWARD</div><div className="text-sm font-bold">{dec.rr}</div></div>
-                <div className="rounded-lg bg-raised p-2.5"><div className="text-[10px] text-secondary">CONFIDENCE</div><div className="text-sm font-bold" style={{ color: dec.tier.color }}>{dec.confidence}/100</div></div>
+                <div className="rounded-lg bg-raised p-2.5"><div className="text-[10px] text-secondary">CONFIDENCE (skóre)</div><div className="text-sm font-bold" style={{ color: dec.tier.color }}>{dec.confidence}/100</div></div>
                 <div className="rounded-lg bg-raised p-2.5"><div className="text-[10px] text-secondary">EXPECTED HOLD</div><div className="text-sm font-bold">{dec.holdRange}</div></div>
               </div>
+              <p className="text-[10px] text-secondary mt-2 leading-relaxed">
+                „Confidence" je interné skóre modelu (zhoda podmienok), <b>nie</b> pravdepodobnosť zisku. Trh sa môže pohnúť proti obchodu bez ohľadu na skóre.
+              </p>
               {dec.reasonsFor && dec.reasonsFor.length > 0 && (
                 <p className="text-[12px] text-secondary mt-3 leading-relaxed"><b style={{ color: "var(--bull)" }}>Why this trade:</b> {dec.reasonsFor.slice(0, 4).join(" · ")}</p>
               )}
               {dec.risks && dec.risks.length > 0 && (
                 <p className="text-[12px] text-secondary mt-1 leading-relaxed"><b style={{ color: "var(--bear)" }}>Why not:</b> {dec.risks.slice(0, 3).join(" · ")}</p>
               )}
-              <button onClick={simulateEntry} disabled={!!active}
-                className={active ? "btn-disabled w-full py-3 rounded-xl font-bold text-sm mt-4" : "btn-enter w-full py-3 rounded-xl font-bold text-sm mt-4"}>
-                {active ? "Pozícia už je otvorená" : "SIMULATE ENTRY"}
+              <button onClick={simulateEntry} disabled={!!active || !live}
+                className={(active || !live) ? "btn-disabled w-full py-3 rounded-xl font-bold text-sm mt-4" : "btn-enter w-full py-3 rounded-xl font-bold text-sm mt-4"}>
+                {active ? "Pozícia už je otvorená" : !live ? "Simulácia dostupná len s reálnymi dátami" : "SIMULATE ENTRY"}
               </button>
-              {!active && <Trading212Checklist trade={dec} assetKey={assetKey} />}
+              {!active && live && <Trading212Checklist trade={dec} assetKey={assetKey} />}
             </>
           ) : (
             <p className="text-[13px] text-secondary text-center leading-relaxed">
@@ -843,9 +900,17 @@ function CalibrationTab() {
       setReport(res.report); setVerdict(res.verdict); setTrades(res.trades || []);
       setState("done");
     } catch (e) {
-      setErr(e.message === "NO_BACKEND"
-        ? "Backend nie je pripojený. Nastav API URL v Nastaveniach a spusti backend (/api/calibrate)."
-        : `Chyba: ${e.message}`);
+      let m;
+      if (e.message === "NO_BACKEND") {
+        m = "Backend nie je pripojený. Nastav API URL v Nastaveniach a spusti backend.";
+      } else if (e.message.includes("500") || e.message.includes("502")) {
+        m = "Kalibrácia na serveri zlyhala (chyba 500/502). Najčastejšie príčiny: backend beží starú verziu (redeployuj najnovší balík — bola tam oprava kalibrácie), alebo je test príliš ťažký na free hosting a vypršal časový limit. Skús to znova alebo zníž počet obchodov.";
+      } else if (e.message.includes("503")) {
+        m = "Dáta nie sú dostupné (503) — Finnhub/Yahoo/Stooq práve nevrátili sviečky. Skús o chvíľu.";
+      } else {
+        m = `Chyba: ${e.message}`;
+      }
+      setErr(m);
       setState("error");
     }
   };
@@ -1602,6 +1667,10 @@ function AIAnalysisTab({ assetKey, a }) {
   const hist1 = deriveHistoricalStat(assetKey, a.bias, 1);
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div className="lg:col-span-2 rounded-xl border p-3 text-center" style={{ background: "var(--bear-soft)", borderColor: "var(--bear)" }}>
+        <span className="font-bold text-sm" style={{ color: "var(--bear)" }}>⚠ DEMO — táto sekcia je vždy simulovaná.</span>
+        <span className="text-[12px] text-secondary"> Scenáre a percentá sú náhodné, menia sa a nemajú prediktívnu hodnotu. Reálne rozhodnutia rob len v sekcii Assistant s pripojeným backendom (badge LIVE).</span>
+      </div>
       <Panel title="Scenáre pravdepodobnosti" icon={Target} right={<Sim />} className="lg:col-span-2">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {[a.scenarioA, a.scenarioB].map((s, idx) => (
@@ -1955,6 +2024,83 @@ function PortfolioTab({ assetKey, a, positions, setPositions }) {
    APP
    ========================================================================= */
 
+function SystemTestTab({ assetKey }) {
+  const [state, setState] = useState("idle"); // idle | running | done | error
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState(null);
+
+  const run = async () => {
+    setState("running"); setErr(null); setResult(null);
+    try {
+      const res = await API.systemTest(assetKey, "15m");
+      setResult(res); setState("done");
+    } catch (e) {
+      setErr(e.message === "NO_BACKEND"
+        ? "Backend nie je pripojený. Nastav API URL v Nastaveniach a spusti backend."
+        : `Chyba: ${e.message}`);
+      setState("error");
+    }
+  };
+
+  const statusColor = (s) => s === "READY" ? "var(--bull)" : s === "WARNING" ? "#e0a13a" : "var(--bear)";
+  const StatusIcon = ({ s }) => s === "READY"
+    ? <CheckCircle2 size={15} className="shrink-0" style={{ color: "var(--bull)" }} />
+    : s === "WARNING"
+    ? <AlertTriangle size={15} className="shrink-0" style={{ color: "#e0a13a" }} />
+    : <X size={15} className="shrink-0" style={{ color: "var(--bear)" }} />;
+
+  return (
+    <div className="space-y-4 max-w-2xl mx-auto">
+      <Panel title="System Test" icon={Activity}>
+        <p className="text-[13px] text-secondary leading-relaxed mb-3">
+          Overí celý reťazec pred obchodovaním: Finnhub pripojenie, čerstvosť dát, dostupnosť sviečok,
+          výpočet indikátorov, decision engine a risk kalkuláciu. Testuje sa na <b>{ASSETS[assetKey].short}</b>.
+        </p>
+        <button onClick={run} disabled={state === "running"}
+          className={state === "running" ? "btn-disabled w-full py-3 rounded-xl font-bold text-sm" : "btn-enter w-full py-3 rounded-xl font-bold text-sm"}>
+          {state === "running" ? "Testujem systém…" : "RUN SYSTEM TEST"}
+        </button>
+        {state === "error" && (
+          <div className="mt-3 rounded-xl bg-bear-soft border border-hairline p-3 text-[13px]" style={{ color: "var(--bear)" }}>{err}</div>
+        )}
+      </Panel>
+
+      {state === "done" && result && (
+        <Panel>
+          <div className="text-center py-3 rounded-xl mb-3" style={{ background: "var(--bg-raised)" }}>
+            <div className="text-[11px] text-secondary font-mono uppercase tracking-wide">System Status</div>
+            <div className="text-2xl font-bold mt-1" style={{ color: statusColor(result.system_status) }}>
+              {result.system_status}
+            </div>
+            {result.data_source && <div className="text-[12px] text-secondary font-mono mt-1">zdroj dát: {result.data_source}</div>}
+          </div>
+          <div className="space-y-1.5">
+            {result.checks.map((c, i) => (
+              <div key={i} className="flex items-start gap-2 rounded-lg border border-hairline px-3 py-2">
+                <StatusIcon s={c.status} />
+                <div className="flex-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[13px] font-medium">{c.check}</span>
+                    <span className="text-[11px] font-mono font-semibold" style={{ color: statusColor(c.status) }}>{c.status}</span>
+                  </div>
+                  {c.detail && <div className="text-[11px] text-secondary mt-0.5">{c.detail}</div>}
+                </div>
+              </div>
+            ))}
+          </div>
+          {result.system_status !== "READY" && (
+            <p className="text-[12px] text-secondary mt-3 leading-relaxed">
+              {result.system_status === "FAILED"
+                ? "Niektorý kritický komponent zlyhal — neobchoduj, kým sa neopraví."
+                : "Systém funguje s upozorneniami (napr. fallback zdroj alebo staršie dáta). Skontroluj detaily vyššie."}
+            </p>
+          )}
+        </Panel>
+      )}
+    </div>
+  );
+}
+
 function SettingsTab() {
   const [url, setUrl] = useState(API.getBase());
   const [saved, setSaved] = useState(false);
@@ -2007,6 +2153,7 @@ const NAV = [
   { id: "journal", label: "Journal", icon: BookOpen },
   { id: "backtest", label: "Backtest", icon: Activity },
   { id: "portfolio", label: "Portfólio", icon: Wallet },
+  { id: "systemtest", label: "System Test", icon: Activity },
   { id: "settings", label: "Nastavenia", icon: KeyRound },
 ];
 
@@ -2157,6 +2304,7 @@ export default function TradingTerminal() {
         {activeTab === "ai" && <AIAnalysisTab assetKey={selectedAsset} a={a} />}
         {activeTab === "decision" && <DecisionTab assetKey={selectedAsset} a={a} marketData={marketData} openTrades={openTrades} setOpenTrades={setOpenTrades} closedTrades={closedTrades} setClosedTrades={setClosedTrades} />}
         {activeTab === "calibration" && <CalibrationTab />}
+        {activeTab === "systemtest" && <SystemTestTab assetKey={selectedAsset} />}
         {activeTab === "settings" && <SettingsTab />}
         {activeTab === "charts" && <ChartsTab assetKey={selectedAsset} a={a} />}
         {activeTab === "journal" && <JournalTab journal={journal} setJournal={setJournal} storageReady={storageReady} />}

@@ -5,5 +5,7 @@ services:
     plan: free
     healthCheckPath: /api/info
     envVars:
+      # Set the real key in the Render dashboard (Environment tab), NOT here.
+      # sync:false keeps the secret out of source control.
       - key: FINNHUB_API_KEY
-        value: d9br8bpr01ql2jmt5gf0d9br8bpr01ql2jmt5gfg
+        sync: false

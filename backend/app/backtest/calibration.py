@@ -1,107 +1,106 @@
-"""Central configuration: symbol mapping, indicator params, scoring weights,
-decision thresholds. Everything tunable lives here so the engine stays clean.
-Values can be overridden via environment variables (see .env.example)."""
+"""AI Calibration — answers one question honestly: does the LIVE decision engine
+have a positive statistical edge on history?
+
+It uses the *exact* same logic as live trading (same TechnicalAnalyzer, structure,
+score engine, entry/SL/TP), the same look-ahead-free Backtester, and the same
+VALID score threshold the live system uses. No separate 'backtest strategy',
+no future-data leakage. It simply keeps collecting executed trades across the
+symbol universe until it has `target` of them, then reports — including the
+calibration-specific signal: average confidence of winners vs losers."""
 from __future__ import annotations
-import os
+from statistics import mean
 
-# ---- symbol mapping: our key -> (yfinance ticker, stooq ticker) -------------
-# ETFs (QQQ/GLD) chosen over index/futures because free sources serve them
-# with clean, complete OHLCV. stooq uses e.g. "aapl.us", "qqq.us", "gld.us".
-SYMBOLS: dict[str, dict] = {
-    "NVDA": {"name": "NVIDIA",        "yf": "NVDA", "stooq": "nvda.us", "class": "stock"},
-    "TSLA": {"name": "Tesla",         "yf": "TSLA", "stooq": "tsla.us", "class": "stock"},
-    "AAPL": {"name": "Apple",         "yf": "AAPL", "stooq": "aapl.us", "class": "stock"},
-    "AMD":  {"name": "AMD",           "yf": "AMD",  "stooq": "amd.us",  "class": "stock"},
-    "META": {"name": "Meta Platforms", "yf": "META", "stooq": "meta.us", "class": "stock"},
-    "MSFT": {"name": "Microsoft",     "yf": "MSFT", "stooq": "msft.us", "class": "stock"},
-    "QQQ":  {"name": "Nasdaq 100 ETF", "yf": "QQQ", "stooq": "qqq.us",  "class": "etf"},
-    "SPY":  {"name": "S&P 500 ETF",   "yf": "SPY",  "stooq": "spy.us",  "class": "etf"},
-    "GLD":  {"name": "Gold ETF",      "yf": "GLD",  "stooq": "gld.us",  "class": "etf"},
-}
+from ..config import SYMBOLS, THRESHOLDS
+from ..engine.service import AnalysisService
+from .engine import Backtester
+from .metrics import compute_metrics
 
-# ---- timeframe mapping to yfinance interval + period ------------------------
-# yfinance limits intraday history (1m ~7d, others ~60d), so period is capped.
-TIMEFRAMES: dict[str, dict] = {
-    "1m":  {"yf_interval": "1m",  "yf_period": "7d",   "minutes": 1},
-    "5m":  {"yf_interval": "5m",  "yf_period": "60d",  "minutes": 5},
-    "15m": {"yf_interval": "15m", "yf_period": "60d",  "minutes": 15},
-    "1h":  {"yf_interval": "60m", "yf_period": "730d", "minutes": 60},
-    "4h":  {"yf_interval": "60m", "yf_period": "730d", "minutes": 240},  # resampled from 1h
-    "1d":  {"yf_interval": "1d",  "yf_period": "max",  "minutes": 1440},
-}
 
-# ---- indicator parameters --------------------------------------------------
-IND = {
-    "ema_fast": 20, "ema_mid": 50, "ema_slow": 200,
-    "rsi": 14, "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
-    "stoch_rsi": 14, "stoch_k": 3, "stoch_d": 3,
-    "atr": 14, "bb": 20, "bb_std": 2.0,
-    "adx": 14, "vol_avg": 20, "vol_spike_mult": 1.8,
-    "swing_lookback": 3,  # bars each side for pivot detection
-}
+def run_calibration(service: AnalysisService, target_trades: int = 100,
+                    timeframe: str = "15m", decision_step: int = 10,
+                    symbols: list[str] | None = None,
+                    data_provider=None) -> dict:
+    """data_provider(symbol_key, timeframe) -> DataFrame lets callers inject
+    synthetic data for offline runs; when None, live data is fetched."""
+    from ..config import TRADE_UNIVERSE
+    symbols = symbols or (TRADE_UNIVERSE or list(SYMBOLS))
+    # live tradable floor: score >= 75 (VALID or HIGH), exactly like production.
+    # THRESHOLDS['weak']=75 is the boundary above which classify_score marks a
+    # setup tradable, so that is the correct calibration threshold.
+    bt = Backtester(service=service, score_threshold=THRESHOLDS["weak"])
 
-# ---- TradeScoreEngine component weights (sum = 100) ------------------------
-WEIGHTS = {
-    "trend": 20,
-    "momentum": 15,
-    "volume": 15,
-    "structure": 20,
-    "volatility": 10,
-    "risk_reward": 10,
-    "conditions": 10,
-}
+    all_trades = []
+    opportunities = 0
+    per_symbol = {}
+    for sym in symbols:
+        if data_provider is not None:
+            df = data_provider(sym, timeframe)
+        else:
+            df, _ = service.data.get_candles(sym, timeframe)
+        res = bt.run(sym, timeframe, df, decision_step=decision_step)
+        opportunities += res["decision_points"]
+        for t in res["trades_detail"]:
+            t["asset"] = sym
+        per_symbol[sym] = len(res["trades_detail"])
+        all_trades.extend(res["trades_detail"])
 
-# ---- decision thresholds ---------------------------------------------------
-THRESHOLDS = {
-    "no_trade": 60,   # < 60  -> NO TRADE
-    "weak": 75,       # 60-75 -> WAIT / WEAK
-    "valid": 85,      # 75-85 -> VALID
-    # 85+ -> HIGH QUALITY
-}
+    # chronological order, then take the first `target` executed trades
+    all_trades.sort(key=lambda t: t["entry_time"])
+    executed = all_trades[:target_trades]
 
-# ---- trade plan params -----------------------------------------------------
-PLAN = {
-    "sl_atr_mult": 1.5,     # stop distance = ATR * this
-    "tp1_rr": 2.0,          # TP1 at RR 1:2
-    "tp2_rr": 3.0,          # TP2 at RR 1:3
-    "min_rr": 2.0,          # reject setups that can't reach 1:2
-}
+    metrics = compute_metrics(executed)
+    winners = [t for t in executed if t["pnl"] > 0]
+    losers = [t for t in executed if t["pnl"] <= 0]
+    avg_conf_win = round(mean([t["score"] for t in winners]), 1) if winners else None
+    avg_conf_los = round(mean([t["score"] for t in losers]), 1) if losers else None
+    avg_hold = round(mean([t["bars_held"] for t in executed]), 1) if executed else None
 
-# ---- SWING TRADING configuration -------------------------------------------
-# The assistant is tuned for SHORT SWING TRADING (2-7 day holds), not scalping.
-SWING = {
-    "main_tf": "4h",        # main analysis timeframe
-    "trend_tf": "1d",       # trend confirmation
-    "entry_tf": "1h",       # entry timing
-    "hold_days_min": 2,
-    "hold_days_max": 7,
-}
-DEFAULT_TIMEFRAME = SWING["main_tf"]
+    report = {
+        "tested_opportunities": opportunities,
+        "executed_trades": len(executed),
+        "winning_trades": len(winners),
+        "losing_trades": len(losers),
+        "win_rate_pct": metrics.get("win_rate"),
+        "avg_winning_trade_pct": metrics.get("avg_win_pct"),
+        "avg_losing_trade_pct": metrics.get("avg_loss_pct"),
+        "profit_factor": metrics.get("profit_factor"),
+        "max_drawdown_pct": metrics.get("max_drawdown_pct"),
+        "expected_value_pct": metrics.get("expected_value_pct"),
+        "expectancy_positive": metrics.get("expectancy_positive"),
+        "avg_confidence_winners": avg_conf_win,
+        "avg_confidence_losers": avg_conf_los,
+        "confidence_calibrated": (avg_conf_win is not None and avg_conf_los is not None
+                                  and avg_conf_win > avg_conf_los),
+        "avg_holding_bars": avg_hold,
+        "trades_per_symbol": per_symbol,
+        "threshold_used": THRESHOLDS["weak"],
+        "timeframe": timeframe,
+    }
+    return {"report": report, "trades": executed}
 
-# ---- historical engine -----------------------------------------------------
-HIST = {
-    "forward_bars": 12,        # look this many bars ahead to measure outcome
-    "min_samples": 20,         # below this, probability is "insufficient data"
-    "success_move_pct": 0.3,   # move >= this % in expected dir counts as success
-    "rsi_bucket": 15,          # bucket width for RSI matching (wider = more matches)
-    "vol_bucket_pct": 25,      # bucket width for volume-change matching
-}
 
-# ---- active trade universe ---------------------------------------------------
-# Symbols the system actively TRADES (scan + calibration). Based on the first
-# real-data 4h calibration (2026-07): trend-followed names + gold carried the
-# edge, while slow index ETFs (QQQ/SPY) and AMD/MSFT bled small stop-losses.
-# All SYMBOLS stay viewable/analyzable; this only narrows what gets traded.
-# Override with env TRADE_UNIVERSE="NVDA,TSLA,..." after your own walk-forward.
-TRADE_UNIVERSE = [s.strip() for s in os.getenv(
-    "TRADE_UNIVERSE", "NVDA,TSLA,AAPL,META,GLD").split(",") if s.strip() in SYMBOLS]
+def calibration_verdict(report: dict, min_trades: int = 30) -> dict:
+    """Honest go/no-go for paper trading based on the calibration."""
+    reasons = []
+    n = report["executed_trades"]
+    ev = report["expected_value_pct"]
+    pf = report["profit_factor"]
 
-DB_PATH = os.getenv("DB_PATH", "trading.db")
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # re-fetch at most this often
+    ok = True
+    if n < min_trades:
+        ok = False
+        reasons.append(f"málo obchodov ({n} < {min_trades})")
+    if ev is None or ev <= 0:
+        ok = False
+        reasons.append(f"Expected Value nie je kladné (EV={ev}%)")
+    if pf is None or pf < 1.2:
+        ok = False
+        reasons.append(f"profit factor pod prahom (PF={pf} < 1.2)")
+    if not report.get("confidence_calibrated"):
+        reasons.append("confidence nie je kalibrované (víťazi nemajú vyššiu istotu než porazení)")
 
-# ---- optional free API keys (system works fully without them) --------------
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d9br8bpr01ql2jmt5gf0d9br8bpr01ql2jmt5gfg")  # primary real-time source; rotate at finnhub.io and override via env
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "")  # optional, 25 req/day only
-
-# ---- CORS: comma-separated allowed origins for the frontend ----------------
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+    if ok:
+        verdict = "Historicky KLADNÁ štatistická výhoda — odporúčam pokračovať na PAPER TRADING"
+    else:
+        verdict = "BEZ dostatočnej výhody — neprechádzať na paper trading, najprv optimalizovať"
+    return {"recommend_paper_trading": ok, "verdict": verdict, "reasons": reasons or ["všetky kritériá splnené"]}

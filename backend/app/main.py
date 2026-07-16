@@ -143,6 +143,7 @@ def quote(symbol: str, timeframe: str = Query("4h")):
     stale = age_h > tf_h * 3
     return {
         "symbol": symbol, "name": SYMBOLS[symbol]["name"],
+        "timeframe": timeframe,
         "current_price": round(price, 4),
         "price_source": price_src,
         "price_timestamp": price_ts.isoformat(),
@@ -154,6 +155,82 @@ def quote(symbol: str, timeframe: str = Query("4h")):
         "age_hours": round(age_h, 1),
         "stale": stale,
     }
+
+
+@app.get("/api/system-test")
+def system_test(symbol: str = Query("NVDA"), timeframe: str = Query("15m")):
+    """SYSTEM TEST — end-to-end readiness check. Returns per-check status and an
+    overall SYSTEM STATUS of READY / WARNING / FAILED."""
+    from datetime import datetime, timezone
+    from .data.finnhub_provider import FinnhubProvider
+    from .config import FINNHUB_API_KEY
+    from .engine.indicators import TechnicalAnalyzer
+    checks = []
+
+    def add(name, status, detail=""):
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    # 1. Finnhub connection
+    if not FINNHUB_API_KEY:
+        add("Finnhub connection", "WARNING", "no FINNHUB_API_KEY set — using Yahoo/Stooq fallback")
+    else:
+        try:
+            FinnhubProvider().get_quote(symbol)
+            add("Finnhub connection", "READY", "quote received")
+        except Exception as e:
+            add("Finnhub connection", "WARNING", f"Finnhub unavailable, will fall back: {e}")
+
+    # 2. Candle availability (via failover chain)
+    df = None
+    src = None
+    try:
+        df, src = service.data.get_candles(symbol, timeframe)
+        add("Candle availability", "READY" if len(df) >= 30 else "WARNING",
+            f"{len(df)} candles from {src}")
+    except Exception as e:
+        add("Candle availability", "FAILED", str(e))
+
+    # 3. Data freshness
+    if df is not None and len(df):
+        ts = df.index[-1]
+        age_h = (datetime.now(timezone.utc) - ts.to_pydatetime()).total_seconds() / 3600
+        tf_h = TIMEFRAMES[timeframe]["minutes"] / 60
+        if age_h <= tf_h * 3:
+            add("Data freshness", "READY", f"last candle {round(age_h,1)}h old")
+        else:
+            add("Data freshness", "WARNING", f"last candle {round(age_h,1)}h old — may be stale")
+    else:
+        add("Data freshness", "FAILED", "no data to check")
+
+    # 4. Indicator calculation
+    if df is not None and len(df) >= 30:
+        try:
+            snap = TechnicalAnalyzer(df).snapshot()
+            ok = snap.get("rsi") is not None and snap.get("atr") is not None
+            add("Indicator calculation", "READY" if ok else "WARNING",
+                f"RSI={snap.get('rsi')} ATR={snap.get('atr')}")
+        except Exception as e:
+            add("Indicator calculation", "FAILED", str(e))
+    else:
+        add("Indicator calculation", "FAILED", "insufficient candles")
+
+    # 5. Decision engine + 6. Risk calculation
+    try:
+        d = service.decide(symbol, timeframe, df=df) if df is not None else service.decide(symbol, timeframe)
+        add("Decision engine", "READY", f"{d['decision']} {d['direction']} score={d['score']}")
+        if d.get("tradable") and d.get("risk_management"):
+            rm = d["risk_management"]
+            add("Risk calculation", "READY", f"size={rm.get('position_size')} max_loss={rm.get('max_loss')}")
+        else:
+            add("Risk calculation", "READY", "no active setup — nothing to size (correct)")
+    except Exception as e:
+        add("Decision engine", "FAILED", str(e))
+        add("Risk calculation", "FAILED", "skipped (decision failed)")
+
+    statuses = [c["status"] for c in checks]
+    overall = "FAILED" if "FAILED" in statuses else ("WARNING" if "WARNING" in statuses else "READY")
+    return {"system_status": overall, "symbol": symbol, "timeframe": timeframe,
+            "data_source": src, "checks": checks}
 
 
 @app.get("/api/candles/{symbol}")
@@ -223,14 +300,20 @@ def calibrate(timeframe: str = Query("15m"), target_trades: int = Query(100, ge=
     leakage; uses the same look-ahead-free backtester as production."""
     if timeframe not in TIMEFRAMES:
         raise HTTPException(400, f"unknown timeframe '{timeframe}'")
-    from .backtest.calibration import run_calibration, calibration_verdict
+    try:
+        from .backtest.calibration import run_calibration, calibration_verdict
+    except ImportError as e:
+        raise HTTPException(500, f"calibration module error: {e}")
     try:
         out = run_calibration(service, target_trades=target_trades,
                               timeframe=timeframe, decision_step=decision_step)
+        out["verdict"] = calibration_verdict(out["report"])
+        return out
     except ProviderError as e:
-        raise HTTPException(503, f"data unavailable: {e}")
-    out["verdict"] = calibration_verdict(out["report"])
-    return out
+        raise HTTPException(503, f"data unavailable (provider): {e}")
+    except Exception as e:
+        # never leak a raw 500 — calibration is heavy and provider-dependent
+        raise HTTPException(502, f"calibration failed: {type(e).__name__}: {e}")
 
 
 @app.get("/api/backtest/{symbol}")
